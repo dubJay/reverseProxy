@@ -1,0 +1,1 @@
+awk ' {match($0,/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/); ip = substr($0,RSTART,RLENGTH); logTime=$1" "$2 ; wantTime = strftime("%b%e", systime()) ; if (logTime == wantTime && $5 ~ "sshd" && ip != "") print ip }' /var/log/auth.log > /home/pi/go_workspace/data/ips.txt

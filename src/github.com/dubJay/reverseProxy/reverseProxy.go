@@ -132,7 +132,7 @@ func newMultiHostReverseProxy(queue chan *url.URL) *httputil.ReverseProxy {
 
 func redirect(w http.ResponseWriter, req *http.Request) {
 	// remove/add not default ports from req.Host
-	target := "https://" + req.Host + strings.TrimRight(req.URL.Path, "/") + *port
+	target := "https://" + req.Host + *port + req.URL.Path
 	log.Print(target)
 	if len(req.URL.RawQuery) > 0 {
 		target += "?" + req.URL.RawQuery
@@ -171,7 +171,8 @@ type Geo struct {
 	Longitude string      `json:"longitude"`
 	DmaCode string        `json:"dma_code"`
 	AreaCode string       `json:"area_code"`
-	TimeZone string       `json:"timezone"`
+	// TimeZone can be a string or bool.
+	TimeZone interface{}  `json:"timezone"`
 	DateTime string       `json:"datetime"`
 }
 
@@ -306,6 +307,10 @@ func refreshMapData() {
 		//     1) Even if ips.txt only has today's entries it's possible for map_data.json
 		//        to contain a full 24 hour record of all attempts.
 		//     2) An edge case is prevented where the Attempts of an ip are counted indefinitely.
+		//
+		// It's worth noting this isn't a true 24 hour snapshot as timestamps are only updated
+		// on each geocode attempt. Timestamp expirations around midnight can yield less than ideal results.
+		// Timing issues should probably be handled in the cron but that's a TODO.
 		if time.Since(time.Unix(iplocation.Timestamp, 0)) <= time.Hour * 24 { 
 			iplocationsMap[iplocation.IP] = &iplocation
 			iplocationsFinal = append(iplocationsFinal, iplocation)
@@ -391,6 +396,8 @@ func main() {
 	srp := newMultiHostReverseProxy(queues.staticQueue)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filepath.Join(*rootDir, "robots.txt"))})
 	mux.HandleFunc("/ssh_map", getMap)
 	mux.HandleFunc("/static/", srp.ServeHTTP)
 	mux.HandleFunc("/images/", srp.ServeHTTP)

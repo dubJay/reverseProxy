@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"html/template"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -25,75 +24,50 @@ import (
 var (
 	// Used to determine when to refresh map data.
 	mapRefresh int64
-	tmpls map[string]*template.Template
 	
-	cert        = flag.String("cert", "", "Concatenation of server's certificate, any intermediates, and the CA's certificate")
+	cert        = flag.String("cert", "", "Concatenation of server's certificate and any intermediates.")
 	hosts       = flag.String("hosts", "", "CSV of all hosts to load balance across")
-	staticHosts = flag.String("static_hosts", "", "CSV of all static hosts to load balance across")
 	key         = flag.String("key", "", "Private key for TLS")
 	port        = flag.String("port", ":8080", "Port for server to listen on")
 	rootDir     = flag.String("rootDir", "", "Path to webdir structure")
 	ssl         = flag.Bool("ssl", false, "Whether to use TLS")
 	dataDir     = flag.String("dataDir", "data", "Text file containing ips from ssh attempts")
-	templates = flag.String("templates", "templates", "Templates directory")
 )
 
-const mapPage = "map.html"
-
-func initTmpls() {
-	var err error
-	tmpls = make(map[string]*template.Template)
-
-	tmpls[mapPage], err = template.New(
-		mapPage).Funcs(template.FuncMap{
-			"marshal": func(v interface{}) template.JS {
-				a, _ := json.Marshal(v)
-				return template.JS(a)
-			},
-		}).ParseFiles(filepath.Join(*rootDir, *templates, mapPage))
-	if err != nil {
-		log.Fatalf("error parsing template %s: %v", mapPage, err)
-	}
-	log.Print("Templates successfully initialized")
-}
-
-type queues struct{
-	queue chan *url.URL
-	staticQueue chan *url.URL
-}
-
 // Simple round robin queue. ATM all backend comps have equal compute power.
-func populateQueue(hosts []string, queue *chan *url.URL) error {
-	tmp := make(chan *url.URL, len(hosts))
-	// Populate queues.
+func populateQueue(hosts []string) ([]*url.URL, error) {
+	var queue []*url.URL
+	if len(hosts) == 0 {
+		return queue, errors.New("No hosts provided for reverse proxy")
+	}
+
+	// Populate queue.
 	for _, host := range hosts {
 		// TODO: Validate host can be reached.
 		url, err := url.Parse(host)
 		if err != nil {
-			log.Printf("Error parsing url %s: %v", host, err)
+			return queue, fmt.Errorf("Error parsing url %s: %v", host, err)
 		}
-		tmp <- url
-	}
-	if len(hosts) == 0 {
-		return errors.New("No hosts provided for reverse proxy")
+		queue = append(queue, url)
 	}
 
-	*queue = tmp
-	return nil
+	return queue, nil
 }
 
-func getNext(queue *chan *url.URL) *url.URL {
+func getNext(hosts []*url.URL, i *int) *url.URL {
 	// Refresh map data trigger. Called everytime a page is requested.
 	go refreshMapData()
 	
-	if len(*queue) == 0 {
-		// Rare case that may occur if under heavy load.
+	if len(hosts) == 0 {
 		log.Printf("Queue empty at %v", time.Now().Unix())
 		return &url.URL{}
 	}
-	var host = <-*queue
-	*queue <- host
-	return host
+
+	if *i >= len(hosts) { *i = 0 }
+	url := hosts[*i]
+	*i++
+
+	return url
 }
 
 // Copy from https://golang.org/src/net/http/httputil/reverseproxy.go
@@ -109,11 +83,12 @@ func singleJoiningSlash(a, b string) string {
 	return a + b
 }
 
-func newMultiHostReverseProxy(queue chan *url.URL) *httputil.ReverseProxy {
+func newMultiHostReverseProxy(hosts []*url.URL) *httputil.ReverseProxy {
 	// Remnant of SingleHostReverseProxy.
 	targetQuery := ""
+	i := 0
 	director := func(req *http.Request) {
-		var target = getNext(&queue)
+		var target = getNext(hosts, &i)
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.URL.Path = singleJoiningSlash(target.Path, req.URL.Path)
@@ -258,6 +233,21 @@ func geocodeIPs(timestamp int64, ips map[string]int32) IPLocations {
 	return iplocations
 }
 
+func readMapData() (string, IPLocations, error) {
+	var iplocations IPLocations
+	dataDirectory := filepath.Join(*rootDir, *dataDir)
+
+	cached, err := ioutil.ReadFile(filepath.Join(dataDirectory, "map_data.json"))
+	if err != nil {
+		return dataDirectory, iplocations, fmt.Errorf("unable to read iplocation.json file:  %v")
+	}
+	err = json.Unmarshal(cached, &iplocations)
+	if err != nil {
+		return dataDirectory, iplocations, fmt.Errorf("unable to unmarshal iplocation.json: %v")
+	}
+	return dataDirectory, iplocations, nil
+}
+
 // This could run as an offline job but for maintenance purposes the trigger is in getMap.
 func refreshMapData() {
 	now := time.Now()
@@ -350,64 +340,21 @@ func refreshMapData() {
 	mapRefresh = time.Now().Add(time.Hour * 2).Unix()
 }
 
-func readMapData() (string, IPLocations, error) {
-	var iplocations IPLocations
-	dataDirectory := filepath.Join(*rootDir, *dataDir)
-
-	cached, err := ioutil.ReadFile(filepath.Join(dataDirectory, "map_data.json"))
-	if err != nil {
-		return dataDirectory, iplocations, fmt.Errorf("unable to read iplocation.json file:  %v")
-	}
-	err = json.Unmarshal(cached, &iplocations)
-	if err != nil {
-		return dataDirectory, iplocations, fmt.Errorf("unable to unmarshal iplocation.json: %v")
-	}
-	return dataDirectory, iplocations, nil
-}
-
-func getMap(w http.ResponseWriter, req *http.Request) {
-	_, iplocations, err := readMapData()
-	if err != nil {
-		log.Printf("Unable to build ssh_map: %v", err)
-		http.Error(w, "unable to parse map data", http.StatusInternalServerError)
-	}
-
-	if err := tmpls[mapPage].Execute(w, iplocations); err != nil {
-		log.Printf("error executing template %s: %v", iplocations, err)
-	}
-}
-
 func main() {
 	flag.Parse()
 
-	initTmpls()
-
-	queues := &queues{}
-	err := populateQueue(strings.Split(*hosts, ","), &queues.queue)
+	queue, err := populateQueue(strings.Split(*hosts, ","))
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = populateQueue(strings.Split(*staticHosts, ","), &queues.staticQueue)
-	if err != nil {
-		log.Fatal(err)
-	}
-	
-	rp := newMultiHostReverseProxy(queues.queue)
-	srp := newMultiHostReverseProxy(queues.staticQueue)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, filepath.Join(*rootDir, "robots.txt"))})
-	mux.HandleFunc("/ssh_map", getMap)
-	mux.HandleFunc("/static/", srp.ServeHTTP)
-	mux.HandleFunc("/images/", srp.ServeHTTP)
-	mux.HandleFunc("/", rp.ServeHTTP)
+	mux.HandleFunc("/", newMultiHostReverseProxy(queue).ServeHTTP)
 
 	if !*ssl {
 		log.Fatal(http.ListenAndServe(*port, mux))
 	} else {
 		go http.ListenAndServe(":80", http.HandlerFunc(redirect))
-		log.Fatal(http.ListenAndServeTLS(
-			*port, filepath.Join(*rootDir, *cert), filepath.Join(*rootDir, *key), mux))
+		log.Fatal(http.ListenAndServeTLS(*port, *cert, *key, mux))
 	}
 }
